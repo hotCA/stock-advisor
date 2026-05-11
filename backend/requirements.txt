@@ -1,0 +1,9 @@
+fastapi==0.115.5
+uvicorn==0.32.1
+anthropic>=0.50.0
+yfinance>=0.2.65
+pandas==2.2.3
+robin-stocks==3.0.6
+apscheduler==3.10.4
+python-dotenv==1.0.1
+httpx==0.27.2

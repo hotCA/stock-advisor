@@ -1,0 +1,472 @@
+import yfinance as yf
+import pandas as pd
+import httpx
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict
+import logging
+
+try:
+    import robin_stocks.robinhood as rh
+    ROBINHOOD_AVAILABLE = True
+except ImportError:
+    ROBINHOOD_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+
+def get_sp500_movers(top_n: int = 10) -> dict:
+    """Fetch top gainers and losers from a curated S&P 500 subset."""
+    from config import SIGNAL_UNIVERSE
+
+    tickers = yf.download(
+        SIGNAL_UNIVERSE,
+        period="2d",
+        interval="1d",
+        progress=False,
+        auto_adjust=True,
+    )
+
+    if tickers.empty:
+        return {"gainers": [], "losers": []}
+
+    close = tickers["Close"]
+    if len(close) < 2:
+        return {"gainers": [], "losers": []}
+
+    pct_change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100).dropna()
+    volume_data = tickers["Volume"].iloc[-1]
+
+    results = []
+    for sym in pct_change.index:
+        price = float(close.iloc[-1][sym]) if sym in close.columns else 0
+        vol = int(volume_data[sym]) if sym in volume_data.index else 0
+        results.append({
+            "symbol": sym,
+            "price": round(price, 2),
+            "change_pct": round(float(pct_change[sym]), 2),
+            "volume": vol,
+        })
+
+    results.sort(key=lambda x: x["change_pct"], reverse=True)
+    gainers = results[:top_n]
+    losers = list(reversed(results))[:top_n]
+
+    return {"gainers": gainers, "losers": losers}
+
+
+def get_stock_history(symbol: str, period: str = "3mo") -> pd.DataFrame:
+    """Fetch OHLCV history for a single ticker."""
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=period, auto_adjust=True)
+    return df
+
+
+def get_batch_history(symbols: List[str], period: str = "3mo") -> Dict[str, pd.DataFrame]:
+    """Fetch OHLCV history for multiple tickers."""
+    result = {}
+    for sym in symbols:
+        try:
+            df = get_stock_history(sym, period)
+            if not df.empty:
+                result[sym] = df
+        except Exception as e:
+            logger.warning(f"Failed to fetch {sym}: {e}")
+    return result
+
+
+def get_options_flow(symbol: str) -> Optional[dict]:
+    """Fetch options chain data and compute put/call ratio + unusual activity."""
+    try:
+        ticker = yf.Ticker(symbol)
+        expirations = ticker.options
+        if not expirations:
+            return None
+
+        # Use the nearest expiration within 30 days
+        nearest = expirations[0]
+        chain = ticker.option_chain(nearest)
+        calls = chain.calls
+        puts = chain.puts
+
+        total_call_oi = int(calls["openInterest"].sum()) if not calls.empty else 0
+        total_put_oi = int(puts["openInterest"].sum()) if not puts.empty else 0
+        pc_ratio = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0
+
+        # Unusual activity = options with volume > 2x open interest
+        unusual_calls = calls[calls["volume"] > calls["openInterest"] * 2].head(3)
+        unusual_puts = puts[puts["volume"] > puts["openInterest"] * 2].head(3)
+
+        def format_rows(df: pd.DataFrame, kind: str) -> list:
+            out = []
+            for _, row in df.iterrows():
+                out.append({
+                    "type": kind,
+                    "strike": float(row.get("strike", 0)),
+                    "expiry": nearest,
+                    "volume": int(row.get("volume", 0)),
+                    "open_interest": int(row.get("openInterest", 0)),
+                    "implied_volatility": round(float(row.get("impliedVolatility", 0)) * 100, 1),
+                })
+            return out
+
+        unusual = format_rows(unusual_calls, "CALL") + format_rows(unusual_puts, "PUT")
+        unusual.sort(key=lambda x: x["volume"], reverse=True)
+
+        price = ticker.info.get("currentPrice") or ticker.fast_info.get("lastPrice") or 0
+
+        return {
+            "symbol": symbol,
+            "price": round(float(price), 2),
+            "expiry": nearest,
+            "put_call_ratio": pc_ratio,
+            "total_call_oi": total_call_oi,
+            "total_put_oi": total_put_oi,
+            "unusual_activity": unusual[:5],
+            "sentiment": "Bearish" if pc_ratio > 1.2 else "Bullish" if pc_ratio < 0.7 else "Neutral",
+        }
+    except Exception as e:
+        logger.warning(f"Options fetch failed for {symbol}: {e}")
+        return None
+
+
+def get_options_summary(symbols: List[str]) -> List[dict]:
+    """Get options flow for a list of symbols."""
+    results = []
+    for sym in symbols:
+        data = get_options_flow(sym)
+        if data:
+            results.append(data)
+    results.sort(key=lambda x: x["put_call_ratio"], reverse=True)
+    return results
+
+
+def _vix_to_score(vix: float) -> float:
+    """Convert VIX level to a 0-100 fear/greed score (inverted: high VIX = fear)."""
+    # VIX <12 → ~90 (Extreme Greed), VIX >35 → ~5 (Extreme Fear)
+    score = 100 - (vix - 10) * 3.5
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _score_to_rating(score: float) -> str:
+    if score >= 75: return "Extreme Greed"
+    if score >= 55: return "Greed"
+    if score >= 45: return "Neutral"
+    if score >= 25: return "Fear"
+    return "Extreme Fear"
+
+
+SECTOR_MAP = {
+    "SPY":  "S&P 500",
+    "QQQ":  "Nasdaq",
+    "XLK":  "Technology",
+    "XLF":  "Financials",
+    "XLE":  "Energy",
+    "XLV":  "Healthcare",
+    "XLI":  "Industrials",
+    "XLY":  "Cons. Discr.",
+    "XLP":  "Cons. Staples",
+    "XLB":  "Materials",
+    "SOXX": "Semis",
+    "GLD":  "Gold",
+    "TLT":  "Bonds",
+    "IWM":  "Small Caps",
+}
+
+
+def get_sector_performance() -> List[dict]:
+    """Fetch today's % change for major sector ETFs."""
+    tickers = list(SECTOR_MAP.keys())
+    try:
+        raw = yf.download(tickers, period="2d", interval="1d",
+                          progress=False, auto_adjust=True)
+        close = raw["Close"]
+        if len(close) < 2:
+            return []
+        pct = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100).dropna()
+        results = []
+        for sym, name in SECTOR_MAP.items():
+            if sym in pct.index:
+                results.append({
+                    "symbol": sym,
+                    "name": name,
+                    "change_pct": round(float(pct[sym]), 2),
+                    "price": round(float(close.iloc[-1][sym]), 2),
+                })
+        return results
+    except Exception as e:
+        logger.warning(f"Sector performance fetch failed: {e}")
+        return []
+
+
+def get_fear_greed_index() -> Optional[dict]:
+    """Compute Fear & Greed score from VIX + SPY momentum (no external API needed)."""
+    try:
+        # Fetch separately — ^VIX doesn't play well in batch downloads
+        vix_series = yf.Ticker("^VIX").history(period="6mo", auto_adjust=True)["Close"].dropna()
+        spy_series = yf.Ticker("SPY").history(period="6mo", auto_adjust=True)["Close"].dropna()
+
+        if vix_series.empty or spy_series.empty:
+            return None
+
+        vix_now   = float(vix_series.iloc[-1])
+        vix_prev  = float(vix_series.iloc[-2])
+        vix_1w    = float(vix_series.iloc[-6]) if len(vix_series) >= 6 else vix_now
+        vix_1mo   = float(vix_series.iloc[-22]) if len(vix_series) >= 22 else vix_now
+
+        # SPY momentum: % above/below 50-day MA shifts score ±10
+        spy_50ma = float(spy_series.tail(50).mean())
+        spy_now  = float(spy_series.iloc[-1])
+        momentum_adj = min(10.0, max(-10.0, (spy_now - spy_50ma) / spy_50ma * 100))
+
+        score       = round(max(0.0, min(100.0, _vix_to_score(vix_now) + momentum_adj)), 1)
+        score_prev  = round(max(0.0, min(100.0, _vix_to_score(vix_prev))), 1)
+        score_1w    = round(max(0.0, min(100.0, _vix_to_score(vix_1w))), 1)
+        score_1mo   = round(max(0.0, min(100.0, _vix_to_score(vix_1mo))), 1)
+
+        return {
+            "score": score,
+            "rating": _score_to_rating(score),
+            "previous_close": score_prev,
+            "previous_1_week": score_1w,
+            "previous_1_month": score_1mo,
+            "vix": round(vix_now, 2),
+        }
+    except Exception as e:
+        logger.warning(f"Fear & Greed fetch failed: {e}")
+        return None
+
+
+_ETF_TICKERS = {
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLK",
+    "XLI", "XLY", "XLP", "XLB", "SOXX", "GLD", "TLT",
+    "SLV", "VXX", "UVXY", "SQQQ", "TQQQ",
+}
+
+
+def get_earnings_calendar(symbols: List[str]) -> List[dict]:
+    """Get upcoming earnings dates for watchlist tickers (next 30 days)."""
+    results = []
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=30)
+
+    # ETFs don't have earnings — skip them to avoid 404 noise
+    symbols = [s for s in symbols if s not in _ETF_TICKERS]
+
+    for sym in symbols:
+        try:
+            ticker = yf.Ticker(sym)
+            cal = ticker.calendar
+            if cal is None:
+                continue
+
+            # calendar can be a dict or DataFrame depending on yfinance version
+            if isinstance(cal, dict):
+                dates = cal.get("Earnings Date", [])
+                eps_est = cal.get("EPS Estimate", None)
+                rev_est = cal.get("Revenue Estimate", None)
+            elif hasattr(cal, "columns"):
+                row = cal.iloc[:, 0] if not cal.empty else {}
+                dates = row.get("Earnings Date", []) if isinstance(row, dict) else []
+                eps_est = row.get("EPS Estimate", None)
+                rev_est = row.get("Revenue Estimate", None)
+            else:
+                continue
+
+            if not dates:
+                continue
+
+            # dates may be a list of Timestamps or a single Timestamp
+            if not isinstance(dates, (list, tuple)):
+                dates = [dates]
+
+            for dt in dates:
+                try:
+                    if hasattr(dt, "tzinfo") and dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    elif not hasattr(dt, "tzinfo"):
+                        continue
+                    if now <= dt <= cutoff:
+                        results.append({
+                            "symbol": sym,
+                            "date": dt.strftime("%Y-%m-%d"),
+                            "eps_estimate": round(float(eps_est), 2) if eps_est is not None else None,
+                            "revenue_estimate": int(rev_est) if rev_est is not None else None,
+                        })
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Earnings calendar failed for {sym}: {e}")
+
+    results.sort(key=lambda x: x["date"])
+    return results
+
+
+_EXCLUDE_WORDS = {
+    "AI", "US", "UK", "EU", "CEO", "CFO", "CTO", "IPO", "ETF", "SEC", "FED",
+    "GDP", "CPI", "IMO", "WSB", "DD", "OTM", "ITM", "ATM", "DTE", "IV", "TA",
+    "PT", "EPS", "PE", "ATH", "EOD", "EOW", "YOLO", "THE", "FOR", "AND", "BUT",
+    "NOT", "ARE", "WAS", "HAS", "HAD", "IRS", "GDP", "PCE", "NFP", "ADP",
+    "LLC", "INC", "ETF", "USD", "CAD", "EUR", "GBP", "JPY", "BTC", "ETH",
+    "NOW", "NEW", "ALL", "ONE", "TWO", "TOP", "BIG", "GET", "USE", "BUY",
+    "SELL", "HOLD", "CALL", "PUT", "SHORT", "LONG", "BULL", "BEAR", "HIGH",
+    "LOW", "UP", "DOWN", "OUT", "OFF", "ON", "IN", "AT", "TO", "FROM",
+}
+
+import re as _re
+_TICKER_RE = _re.compile(r'\b([A-Z]{2,5})\b')
+
+
+def get_reddit_sentiment() -> List[dict]:
+    """Fetch top mentioned tickers from r/wallstreetbets, r/stocks, r/options."""
+    from collections import defaultdict
+    mention_counts: dict = defaultdict(int)
+    mention_scores: dict = defaultdict(int)
+    mention_titles: dict = defaultdict(list)
+
+    headers = {"User-Agent": "StockAdvisorBot/1.0 (educational)"}
+    subreddits = ["wallstreetbets", "stocks", "options"]
+
+    with httpx.Client(timeout=15) as client:
+        for sub in subreddits:
+            try:
+                resp = client.get(
+                    f"https://www.reddit.com/r/{sub}/hot.json?limit=100",
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    continue
+                posts = resp.json().get("data", {}).get("children", [])
+                for post in posts:
+                    d = post.get("data", {})
+                    title = d.get("title", "")
+                    score = int(d.get("score", 0))
+                    text = title + " " + d.get("selftext", "")[:300]
+                    tickers = set(_TICKER_RE.findall(text.upper())) - _EXCLUDE_WORDS
+                    for t in tickers:
+                        mention_counts[t] += 1
+                        mention_scores[t] += score
+                        if len(mention_titles[t]) < 2:
+                            mention_titles[t].append(title[:120])
+            except Exception as e:
+                logger.warning(f"Reddit fetch failed for r/{sub}: {e}")
+
+    results = []
+    for ticker, count in mention_counts.items():
+        if count >= 2 or mention_scores[ticker] >= 200:
+            results.append({
+                "symbol": ticker,
+                "mentions": count,
+                "score": mention_scores[ticker],
+                "titles": mention_titles[ticker],
+            })
+
+    results.sort(key=lambda x: x["mentions"] * 5 + x["score"] / 500, reverse=True)
+    return results[:25]
+
+
+def get_sparklines(symbols: List[str]) -> List[dict]:
+    """Return ~22 trading days of close prices for mini sparkline charts."""
+    try:
+        raw = yf.download(symbols, period="1mo", interval="1d",
+                          progress=False, auto_adjust=True)
+        if raw.empty:
+            return []
+        close = raw["Close"] if hasattr(raw["Close"], "columns") else raw["Close"].to_frame()
+        results = []
+        for sym in symbols:
+            col = sym if sym in close.columns else None
+            if col is None:
+                continue
+            prices = close[col].dropna().tolist()
+            if prices:
+                results.append({"symbol": sym, "prices": [round(float(p), 2) for p in prices]})
+        return results
+    except Exception as e:
+        logger.warning(f"Sparklines fetch failed: {e}")
+        return []
+
+
+def get_news(symbols: List[str]) -> List[dict]:
+    """Fetch recent news headlines for key tickers."""
+    results = []
+    for sym in symbols[:14]:
+        try:
+            ticker = yf.Ticker(sym)
+            news_items = ticker.news or []
+            for item in news_items[:3]:
+                # Support both old and new yfinance news formats
+                content = item.get("content", {})
+                title = item.get("title") or content.get("title", "")
+                link = (item.get("link") or
+                        content.get("canonicalUrl", {}).get("url", "") or
+                        content.get("clickThroughUrl", {}).get("url", ""))
+                publisher = (item.get("publisher") or
+                             content.get("provider", {}).get("displayName", ""))
+                pub_time = item.get("providerPublishTime") or 0
+                if title:
+                    results.append({
+                        "symbol": sym,
+                        "title": title,
+                        "publisher": publisher,
+                        "link": link,
+                        "published": pub_time,
+                    })
+        except Exception as e:
+            logger.warning(f"News fetch failed for {sym}: {e}")
+    results.sort(key=lambda x: x["published"], reverse=True)
+    return results[:30]
+
+
+def login_robinhood(username: str, password: str, mfa_code: str = "") -> bool:
+    """Log in to Robinhood (optional)."""
+    if not ROBINHOOD_AVAILABLE or not username or not password:
+        return False
+    try:
+        kwargs = {"username": username, "password": password, "store_session": True}
+        if mfa_code:
+            kwargs["mfa_code"] = mfa_code
+        rh.login(**kwargs)
+        return True
+    except Exception as e:
+        logger.warning(f"Robinhood login failed: {e}")
+        return False
+
+
+def get_robinhood_portfolio() -> Optional[dict]:
+    """Fetch Robinhood portfolio data (requires login)."""
+    if not ROBINHOOD_AVAILABLE:
+        return None
+    try:
+        profile = rh.load_portfolio_profile()
+        positions = rh.get_open_stock_positions()
+
+        holdings = []
+        for pos in (positions or []):
+            instrument_url = pos.get("instrument", "")
+            try:
+                info = rh.get_instrument_by_url(instrument_url)
+                symbol = info.get("symbol", "")
+                qty = float(pos.get("quantity", 0))
+                avg_price = float(pos.get("average_buy_price", 0))
+                quotes = rh.get_quotes([symbol])
+                current = float(quotes[0].get("last_trade_price", 0)) if quotes else 0
+                holdings.append({
+                    "symbol": symbol,
+                    "quantity": qty,
+                    "avg_price": round(avg_price, 2),
+                    "current_price": round(current, 2),
+                    "pnl": round((current - avg_price) * qty, 2),
+                    "pnl_pct": round((current - avg_price) / avg_price * 100, 2) if avg_price else 0,
+                })
+            except Exception:
+                continue
+
+        return {
+            "equity": float(profile.get("equity", 0) or 0),
+            "cash": float(profile.get("withdrawable_amount", 0) or 0),
+            "holdings": holdings,
+        }
+    except Exception as e:
+        logger.warning(f"Portfolio fetch failed: {e}")
+        return None
