@@ -97,6 +97,21 @@ Edit `backend/config.py` to customize:
 
 Costs are primarily Claude API usage (Opus 4.7).
 
+## Disclaimer
+
+> **This project is for educational and informational purposes only.**
+
+This application and all content it generates — including but not limited to trade signals, buy/sell recommendations, price targets, stop losses, options plays, and AI-generated market reports — **does not constitute financial advice**.
+
+- I am not a licensed financial advisor, broker, or investment professional
+- Past signal accuracy does not guarantee future results
+- Stock trading involves substantial risk of loss and is not suitable for every investor
+- You may lose some or all of your invested capital
+- Always do your own research (DYOR) before making any investment decisions
+- Consult a qualified financial advisor before trading
+
+**Use this software entirely at your own risk.** The author(s) of this project accept no responsibility or liability for any financial losses incurred through the use of this application.
+
 ## License
 
 MIT
