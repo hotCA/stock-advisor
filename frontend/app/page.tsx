@@ -10,6 +10,8 @@ import EarningsCalendar from "@/components/EarningsCalendar";
 import SectorHeatmap from "@/components/SectorHeatmap";
 import NewsFeed from "@/components/NewsFeed";
 import RedditSentiment from "@/components/RedditSentiment";
+import PaperTrading from "@/components/PaperTrading";
+import MostTraded from "@/components/MostTraded";
 import {
   getMovers,
   getSignals,
@@ -21,6 +23,7 @@ import {
   getSparklines,
   getNewsData,
   getRedditSentiment,
+  getMostTraded,
   forceRefresh,
   type Mover,
   type Signal,
@@ -31,9 +34,13 @@ import {
   type SparklineData,
   type NewsItem,
   type RedditMention,
+  type MostTradedData,
 } from "@/lib/api";
 
+type Tab = "dashboard" | "paper";
+
 export default function Dashboard() {
+  const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const [gainers, setGainers] = useState<Mover[]>([]);
   const [losers, setLosers] = useState<Mover[]>([]);
   const [signals, setSignals] = useState<Signal[]>([]);
@@ -46,6 +53,7 @@ export default function Dashboard() {
   const [sparklines, setSparklines] = useState<SparklineData[]>([]);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [reddit, setReddit] = useState<RedditMention[]>([]);
+  const [mostTraded, setMostTraded] = useState<MostTradedData | null>(null);
   const [lastRefresh, setLastRefresh] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -54,7 +62,7 @@ export default function Dashboard() {
   const fetchAll = useCallback(async () => {
     try {
       setError("");
-      const [moversRes, signalsRes, optionsRes, reportRes, fgRes, earningsRes, sectorsRes, sparklinesRes, newsRes, redditRes] =
+      const [moversRes, signalsRes, optionsRes, reportRes, fgRes, earningsRes, sectorsRes, sparklinesRes, newsRes, redditRes, mostTradedRes] =
         await Promise.all([
           getMovers(),
           getSignals(),
@@ -66,6 +74,7 @@ export default function Dashboard() {
           getSparklines(),
           getNewsData(),
           getRedditSentiment(),
+          getMostTraded(),
         ]);
 
       const stillLoading = moversRes.loading || signalsRes.loading;
@@ -82,6 +91,7 @@ export default function Dashboard() {
       setSparklines(sparklinesRes.data ?? []);
       setNews(newsRes.data ?? []);
       setReddit(redditRes.data ?? []);
+      setMostTraded(mostTradedRes.data ?? null);
       setLastRefresh(moversRes.last_refresh ?? "");
       setLoading(stillLoading);
     } catch (e) {
@@ -147,6 +157,36 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      {/* Tab navigation */}
+      <div className="flex gap-1 border-b border-[#21262d] pb-0">
+        <button
+          onClick={() => setActiveTab("dashboard")}
+          className={`px-4 py-2 text-sm font-medium rounded-t transition-colors -mb-px ${
+            activeTab === "dashboard"
+              ? "bg-[#161b22] border border-b-[#161b22] border-[#21262d] text-zinc-100"
+              : "text-zinc-500 hover:text-zinc-300"
+          }`}
+        >
+          Dashboard
+        </button>
+        <button
+          onClick={() => setActiveTab("paper")}
+          className={`px-4 py-2 text-sm font-medium rounded-t transition-colors -mb-px flex items-center gap-1.5 ${
+            activeTab === "paper"
+              ? "bg-[#161b22] border border-b-[#161b22] border-[#21262d] text-zinc-100"
+              : "text-zinc-500 hover:text-zinc-300"
+          }`}
+        >
+          <span className="w-2 h-2 rounded-full bg-yellow-500 inline-block" />
+          Paper Trading
+        </button>
+      </div>
+
+      {activeTab === "paper" && (
+        <PaperTrading signals={signals} movers={[...gainers, ...losers]} />
+      )}
+
+      {activeTab === "dashboard" && <>
       {/* Earnings Calendar */}
       {earnings.length > 0 && <EarningsCalendar events={earnings} />}
 
@@ -192,6 +232,9 @@ export default function Dashboard() {
       {/* Market Movers */}
       <MarketMovers gainers={gainers} losers={losers} />
 
+      {/* Most Traded */}
+      <MostTraded data={mostTraded} />
+
       {/* Trade Signals */}
       <SignalsTable signals={signals} marketSummary={marketSummary} sparklines={sparklines} />
 
@@ -203,6 +246,7 @@ export default function Dashboard() {
 
       {/* Options Flow */}
       {options.length > 0 && <OptionsFlow options={options} />}
+      </>}
     </div>
   );
 }

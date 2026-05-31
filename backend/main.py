@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Optional
@@ -27,6 +29,7 @@ from data.fetcher import (
     get_sparklines,
     get_news,
     get_reddit_sentiment,
+    get_most_traded,
 )
 from data.indicators import analyze_ticker
 from ai.analyzer import generate_signals, generate_daily_report, stream_report
@@ -56,6 +59,7 @@ _cache: dict = {
     "sparklines": None,
     "news": None,
     "reddit": None,
+    "most_traded": None,
     "last_refresh": None,
 }
 
@@ -99,12 +103,66 @@ def _refresh_all() -> None:
     # Reddit sentiment
     _cache["reddit"] = get_reddit_sentiment()
 
+    # Most traded by volume
+    _cache["most_traded"] = get_most_traded()
+
     # AI daily report
     report = generate_daily_report(signals, movers, options)
     _cache["report"] = report
     _cache["last_refresh"] = datetime.utcnow().isoformat() + "Z"
 
+    # Log predictions snapshot for future validation
+    _log_predictions(signals)
+
     logger.info(f"Refresh complete in {time.time() - start:.1f}s")
+
+
+PREDICTIONS_LOG = os.path.join(os.path.dirname(__file__), "data", "predictions_log.json")
+
+
+def _log_predictions(signals) -> None:
+    """Append current signals snapshot to predictions_log.json for future accuracy tracking."""
+    if not signals:
+        return
+    try:
+        if os.path.exists(PREDICTIONS_LOG):
+            with open(PREDICTIONS_LOG, "r") as f:
+                log = json.load(f)
+        else:
+            log = []
+
+        # Build a serializable snapshot of each signal
+        signal_list = signals.get("signals", []) if isinstance(signals, dict) else signals
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "signals": [
+                {
+                    "symbol": s.get("symbol", ""),
+                    "signal": s.get("signal", ""),
+                    "confidence": s.get("confidence", ""),
+                    "entry": s.get("entry", 0),
+                    "target": s.get("target", 0),
+                    "stop_loss": s.get("stop_loss", 0),
+                }
+                for s in signal_list
+                if s.get("signal") in ("BUY", "SELL")
+            ],
+        }
+
+        # Deduplicate: skip if we already logged today
+        if log and log[-1].get("date") == entry["date"]:
+            log[-1] = entry  # replace with fresh run
+        else:
+            log.append(entry)
+
+        # Keep last 90 days
+        log = log[-90:]
+
+        with open(PREDICTIONS_LOG, "w") as f:
+            json.dump(log, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to log predictions: {e}")
 
 
 _loading = False
@@ -233,6 +291,25 @@ def force_refresh():
             _refresh_running = False
     threading.Thread(target=_run, daemon=True).start()
     return {"status": "started", "last_refresh": _cache["last_refresh"]}
+
+
+@app.get("/api/most-traded")
+def get_most_traded_endpoint():
+    return {"data": _cache["most_traded"], "last_refresh": _cache["last_refresh"], "loading": _cache["most_traded"] is None}
+
+
+@app.get("/api/predictions/history")
+def get_predictions_history():
+    """Return logged daily prediction snapshots for accuracy tracking."""
+    if not os.path.exists(PREDICTIONS_LOG):
+        return {"data": [], "count": 0}
+    try:
+        with open(PREDICTIONS_LOG, "r") as f:
+            log = json.load(f)
+        return {"data": log, "count": len(log)}
+    except Exception as e:
+        logger.warning(f"Failed to read predictions log: {e}")
+        return {"data": [], "count": 0}
 
 
 @app.get("/api/health")

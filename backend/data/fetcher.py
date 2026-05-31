@@ -3,6 +3,11 @@ import pandas as pd
 import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
+
+# Disable yfinance's SQLite timezone cache to prevent "database is locked" errors
+# when multiple downloads run concurrently in background threads
+import tempfile as _tempfile
+yf.set_tz_cache_location(_tempfile.gettempdir())
 import logging
 
 try:
@@ -24,6 +29,7 @@ def get_sp500_movers(top_n: int = 10) -> dict:
         interval="1d",
         progress=False,
         auto_adjust=True,
+        threads=False,
     )
 
     if tickers.empty:
@@ -178,7 +184,7 @@ def get_sector_performance() -> List[dict]:
     tickers = list(SECTOR_MAP.keys())
     try:
         raw = yf.download(tickers, period="2d", interval="1d",
-                          progress=False, auto_adjust=True)
+                          progress=False, auto_adjust=True, threads=False)
         close = raw["Close"]
         if len(close) < 2:
             return []
@@ -369,7 +375,7 @@ def get_sparklines(symbols: List[str]) -> List[dict]:
     """Return ~22 trading days of close prices for mini sparkline charts."""
     try:
         raw = yf.download(symbols, period="1mo", interval="1d",
-                          progress=False, auto_adjust=True)
+                          progress=False, auto_adjust=True, threads=False)
         if raw.empty:
             return []
         close = raw["Close"] if hasattr(raw["Close"], "columns") else raw["Close"].to_frame()
@@ -416,6 +422,46 @@ def get_news(symbols: List[str]) -> List[dict]:
             logger.warning(f"News fetch failed for {sym}: {e}")
     results.sort(key=lambda x: x["published"], reverse=True)
     return results[:30]
+
+
+def get_most_traded(top_n: int = 20) -> dict:
+    """Return top tickers by volume over day, week, and month windows."""
+    from config import SIGNAL_UNIVERSE
+    try:
+        raw = yf.download(SIGNAL_UNIVERSE, period="1mo", interval="1d",
+                          progress=False, auto_adjust=True, threads=False)
+        if raw.empty:
+            return {"day": [], "week": [], "month": []}
+
+        volume = raw["Volume"].dropna(how="all")
+        close = raw["Close"]
+
+        def top_by_volume(vol_series: pd.Series, n: int) -> list:
+            ranked = vol_series.sort_values(ascending=False).head(n)
+            result = []
+            for sym in ranked.index:
+                price = float(close.iloc[-1][sym]) if sym in close.columns else 0
+                if len(close) >= 2 and sym in close.columns:
+                    prev = float(close.iloc[-2][sym])
+                    change_pct = round((price - prev) / prev * 100, 2) if prev else 0
+                else:
+                    change_pct = 0
+                result.append({
+                    "symbol": sym,
+                    "volume": int(ranked[sym]),
+                    "price": round(price, 2),
+                    "change_pct": change_pct,
+                })
+            return result
+
+        return {
+            "day": top_by_volume(volume.iloc[-1].dropna(), top_n),
+            "week": top_by_volume(volume.tail(5).sum().dropna(), top_n),
+            "month": top_by_volume(volume.sum().dropna(), top_n),
+        }
+    except Exception as e:
+        logger.warning(f"Most traded fetch failed: {e}")
+        return {"day": [], "week": [], "month": []}
 
 
 def login_robinhood(username: str, password: str, mfa_code: str = "") -> bool:

@@ -197,3 +197,46 @@ export async function getRedditSentiment(): Promise<{
 export async function forceRefresh(): Promise<void> {
   await fetch(`${BASE}/refresh`, { method: "POST" });
 }
+
+export interface PredictionSignal {
+  symbol: string;
+  signal: "BUY" | "SELL";
+  confidence: string;
+  entry: number;
+  target: number;
+  stop_loss: number;
+}
+
+export interface PredictionEntry {
+  timestamp: string;
+  date: string;
+  signals: PredictionSignal[];
+}
+
+export interface MostTradedItem {
+  symbol: string;
+  volume: number;
+  price: number;
+  change_pct: number;
+}
+
+export interface MostTradedData {
+  day: MostTradedItem[];
+  week: MostTradedItem[];
+  month: MostTradedItem[];
+}
+
+export async function getMostTraded(): Promise<{
+  data: MostTradedData | null;
+  last_refresh: string;
+  loading: boolean;
+}> {
+  return fetchJson("/most-traded");
+}
+
+export async function getPredictionsHistory(): Promise<{
+  data: PredictionEntry[];
+  count: number;
+}> {
+  return fetchJson("/predictions/history");
+}
