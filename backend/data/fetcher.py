@@ -1,13 +1,21 @@
 import yfinance as yf
 import pandas as pd
 import httpx
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
-# Disable yfinance's SQLite timezone cache to prevent "database is locked" errors
-# when multiple downloads run concurrently in background threads
-import tempfile as _tempfile
-yf.set_tz_cache_location(_tempfile.gettempdir())
+# Replace yfinance's SQLite timezone cache with its built-in no-op cache.
+# The SQLite cache serializes on a file lock and raises "database is locked"
+# when several downloads run concurrently (threads=True / our thread pool),
+# intermittently dropping tickers. The dummy cache just re-resolves the
+# timezone from each chart response, which removes the contention entirely.
+try:
+    from yfinance import cache as _yf_cache
+    _yf_cache._TzCacheManager._tz_cache = _yf_cache._TzCacheDummy()
+except Exception:  # pragma: no cover - fall back to a private temp dir
+    import tempfile as _tempfile
+    yf.set_tz_cache_location(_tempfile.gettempdir())
 import logging
 
 try:
@@ -19,18 +27,42 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def get_sp500_movers(top_n: int = 10) -> dict:
-    """Fetch top gainers and losers from a curated S&P 500 subset."""
-    from config import SIGNAL_UNIVERSE
+def download_universe(symbols: List[str], period: str = "3mo") -> pd.DataFrame:
+    """One batched OHLCV download for the whole universe.
 
-    tickers = yf.download(
-        SIGNAL_UNIVERSE,
-        period="2d",
+    The 3-month panel is a superset of what movers (2d), sparklines (1mo),
+    most-traded (1mo) and per-ticker history (3mo) each need, so we fetch it
+    once and slice locally instead of hitting Yahoo four separate times.
+    threads=True lets yfinance parallelize the underlying requests.
+    """
+    return yf.download(
+        symbols,
+        period=period,
         interval="1d",
         progress=False,
         auto_adjust=True,
-        threads=False,
+        threads=True,
+        group_by="column",
     )
+
+
+def _ticker_ohlcv(panel: pd.DataFrame, sym: str) -> Optional[pd.DataFrame]:
+    """Extract a single ticker's OHLCV frame from a multi-ticker panel."""
+    if not isinstance(panel.columns, pd.MultiIndex):
+        # Single-ticker download: columns are already Open/High/Low/Close/Volume
+        return panel.dropna(how="all")
+    try:
+        df = panel.xs(sym, axis=1, level=1)
+    except KeyError:
+        return None
+    return df.dropna(how="all")
+
+
+def get_sp500_movers(top_n: int = 10, panel: Optional[pd.DataFrame] = None) -> dict:
+    """Fetch top gainers and losers from a curated S&P 500 subset."""
+    from config import SIGNAL_UNIVERSE
+
+    tickers = panel if panel is not None else download_universe(SIGNAL_UNIVERSE)
 
     if tickers.empty:
         return {"gainers": [], "losers": []}
@@ -67,16 +99,26 @@ def get_stock_history(symbol: str, period: str = "3mo") -> pd.DataFrame:
     return df
 
 
-def get_batch_history(symbols: List[str], period: str = "3mo") -> Dict[str, pd.DataFrame]:
-    """Fetch OHLCV history for multiple tickers."""
+def get_batch_history(
+    symbols: List[str],
+    period: str = "3mo",
+    panel: Optional[pd.DataFrame] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Fetch OHLCV history for multiple tickers in a single batched download.
+
+    Replaces the previous per-ticker loop (~70 sequential HTTP requests) with
+    one batched call, slicing each ticker's frame out of the shared panel.
+    """
+    if panel is None:
+        panel = download_universe(symbols, period)
+    if panel.empty:
+        return {}
+
     result = {}
     for sym in symbols:
-        try:
-            df = get_stock_history(sym, period)
-            if not df.empty:
-                result[sym] = df
-        except Exception as e:
-            logger.warning(f"Failed to fetch {sym}: {e}")
+        df = _ticker_ohlcv(panel, sym)
+        if df is not None and not df.empty:
+            result[sym] = df
     return result
 
 
@@ -118,7 +160,11 @@ def get_options_flow(symbol: str) -> Optional[dict]:
         unusual = format_rows(unusual_calls, "CALL") + format_rows(unusual_puts, "PUT")
         unusual.sort(key=lambda x: x["volume"], reverse=True)
 
-        price = ticker.info.get("currentPrice") or ticker.fast_info.get("lastPrice") or 0
+        # fast_info avoids the slow .info scrape (a full quote-summary HTTP call)
+        try:
+            price = ticker.fast_info.get("lastPrice") or 0
+        except Exception:
+            price = 0
 
         return {
             "symbol": symbol,
@@ -136,12 +182,9 @@ def get_options_flow(symbol: str) -> Optional[dict]:
 
 
 def get_options_summary(symbols: List[str]) -> List[dict]:
-    """Get options flow for a list of symbols."""
-    results = []
-    for sym in symbols:
-        data = get_options_flow(sym)
-        if data:
-            results.append(data)
+    """Get options flow for a list of symbols (fetched in parallel)."""
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = [d for d in ex.map(get_options_flow, symbols) if d]
     results.sort(key=lambda x: x["put_call_ratio"], reverse=True)
     return results
 
@@ -249,60 +292,74 @@ _ETF_TICKERS = {
 }
 
 
+def _earnings_for_symbol(sym: str, now: datetime, cutoff: datetime) -> Optional[dict]:
+    """Fetch the next earnings event for a single ticker within the window."""
+    try:
+        ticker = yf.Ticker(sym)
+        cal = ticker.calendar
+        if cal is None:
+            return None
+
+        # calendar can be a dict or DataFrame depending on yfinance version
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date", [])
+            eps_est = cal.get("EPS Estimate", None)
+            rev_est = cal.get("Revenue Estimate", None)
+        elif hasattr(cal, "columns"):
+            row = cal.iloc[:, 0] if not cal.empty else {}
+            dates = row.get("Earnings Date", []) if isinstance(row, dict) else []
+            eps_est = row.get("EPS Estimate", None)
+            rev_est = row.get("Revenue Estimate", None)
+        else:
+            return None
+
+        if not dates:
+            return None
+
+        # dates may be a list of Timestamps or a single Timestamp
+        if not isinstance(dates, (list, tuple)):
+            dates = [dates]
+
+        for dt in dates:
+            try:
+                # yfinance may return a tz-aware datetime, a naive datetime, or a
+                # plain datetime.date. Normalize all to a tz-aware UTC datetime.
+                # (datetime is a subclass of date, so check it first.)
+                if isinstance(dt, datetime):
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                elif isinstance(dt, date):
+                    dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+                else:
+                    continue
+                if now <= dt <= cutoff:
+                    return {
+                        "symbol": sym,
+                        "date": dt.strftime("%Y-%m-%d"),
+                        "eps_estimate": round(float(eps_est), 2) if eps_est is not None else None,
+                        "revenue_estimate": int(rev_est) if rev_est is not None else None,
+                    }
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        logger.warning(f"Earnings calendar failed for {sym}: {e}")
+        return None
+
+
 def get_earnings_calendar(symbols: List[str]) -> List[dict]:
-    """Get upcoming earnings dates for watchlist tickers (next 30 days)."""
-    results = []
+    """Get upcoming earnings dates for watchlist tickers (next 30 days, in parallel)."""
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(days=30)
 
     # ETFs don't have earnings — skip them to avoid 404 noise
     symbols = [s for s in symbols if s not in _ETF_TICKERS]
 
-    for sym in symbols:
-        try:
-            ticker = yf.Ticker(sym)
-            cal = ticker.calendar
-            if cal is None:
-                continue
-
-            # calendar can be a dict or DataFrame depending on yfinance version
-            if isinstance(cal, dict):
-                dates = cal.get("Earnings Date", [])
-                eps_est = cal.get("EPS Estimate", None)
-                rev_est = cal.get("Revenue Estimate", None)
-            elif hasattr(cal, "columns"):
-                row = cal.iloc[:, 0] if not cal.empty else {}
-                dates = row.get("Earnings Date", []) if isinstance(row, dict) else []
-                eps_est = row.get("EPS Estimate", None)
-                rev_est = row.get("Revenue Estimate", None)
-            else:
-                continue
-
-            if not dates:
-                continue
-
-            # dates may be a list of Timestamps or a single Timestamp
-            if not isinstance(dates, (list, tuple)):
-                dates = [dates]
-
-            for dt in dates:
-                try:
-                    if hasattr(dt, "tzinfo") and dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    elif not hasattr(dt, "tzinfo"):
-                        continue
-                    if now <= dt <= cutoff:
-                        results.append({
-                            "symbol": sym,
-                            "date": dt.strftime("%Y-%m-%d"),
-                            "eps_estimate": round(float(eps_est), 2) if eps_est is not None else None,
-                            "revenue_estimate": int(rev_est) if rev_est is not None else None,
-                        })
-                        break
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"Earnings calendar failed for {sym}: {e}")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = [
+            r for r in ex.map(lambda s: _earnings_for_symbol(s, now, cutoff), symbols)
+            if r
+        ]
 
     results.sort(key=lambda x: x["date"])
     return results
@@ -371,14 +428,16 @@ def get_reddit_sentiment() -> List[dict]:
     return results[:25]
 
 
-def get_sparklines(symbols: List[str]) -> List[dict]:
+def get_sparklines(symbols: List[str], panel: Optional[pd.DataFrame] = None) -> List[dict]:
     """Return ~22 trading days of close prices for mini sparkline charts."""
     try:
-        raw = yf.download(symbols, period="1mo", interval="1d",
-                          progress=False, auto_adjust=True, threads=False)
+        raw = panel if panel is not None else download_universe(symbols, "1mo")
         if raw.empty:
             return []
         close = raw["Close"] if hasattr(raw["Close"], "columns") else raw["Close"].to_frame()
+        # Limit to the most recent month so sparklines stay short even when fed
+        # the shared 3-month panel.
+        close = close.tail(22)
         results = []
         for sym in symbols:
             col = sym if sym in close.columns else None
@@ -393,48 +452,56 @@ def get_sparklines(symbols: List[str]) -> List[dict]:
         return []
 
 
+def _news_for_symbol(sym: str) -> List[dict]:
+    """Fetch up to 3 recent headlines for a single ticker."""
+    out = []
+    try:
+        ticker = yf.Ticker(sym)
+        news_items = ticker.news or []
+        for item in news_items[:3]:
+            # Support both old and new yfinance news formats
+            content = item.get("content", {})
+            title = item.get("title") or content.get("title", "")
+            link = (item.get("link") or
+                    content.get("canonicalUrl", {}).get("url", "") or
+                    content.get("clickThroughUrl", {}).get("url", ""))
+            publisher = (item.get("publisher") or
+                         content.get("provider", {}).get("displayName", ""))
+            pub_time = item.get("providerPublishTime") or 0
+            if title:
+                out.append({
+                    "symbol": sym,
+                    "title": title,
+                    "publisher": publisher,
+                    "link": link,
+                    "published": pub_time,
+                })
+    except Exception as e:
+        logger.warning(f"News fetch failed for {sym}: {e}")
+    return out
+
+
 def get_news(symbols: List[str]) -> List[dict]:
-    """Fetch recent news headlines for key tickers."""
-    results = []
-    for sym in symbols[:14]:
-        try:
-            ticker = yf.Ticker(sym)
-            news_items = ticker.news or []
-            for item in news_items[:3]:
-                # Support both old and new yfinance news formats
-                content = item.get("content", {})
-                title = item.get("title") or content.get("title", "")
-                link = (item.get("link") or
-                        content.get("canonicalUrl", {}).get("url", "") or
-                        content.get("clickThroughUrl", {}).get("url", ""))
-                publisher = (item.get("publisher") or
-                             content.get("provider", {}).get("displayName", ""))
-                pub_time = item.get("providerPublishTime") or 0
-                if title:
-                    results.append({
-                        "symbol": sym,
-                        "title": title,
-                        "publisher": publisher,
-                        "link": link,
-                        "published": pub_time,
-                    })
-        except Exception as e:
-            logger.warning(f"News fetch failed for {sym}: {e}")
+    """Fetch recent news headlines for key tickers (in parallel)."""
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        batches = ex.map(_news_for_symbol, symbols[:14])
+    results = [item for batch in batches for item in batch]
     results.sort(key=lambda x: x["published"], reverse=True)
     return results[:30]
 
 
-def get_most_traded(top_n: int = 20) -> dict:
+def get_most_traded(top_n: int = 20, panel: Optional[pd.DataFrame] = None) -> dict:
     """Return top tickers by volume over day, week, and month windows."""
     from config import SIGNAL_UNIVERSE
     try:
-        raw = yf.download(SIGNAL_UNIVERSE, period="1mo", interval="1d",
-                          progress=False, auto_adjust=True, threads=False)
+        raw = panel if panel is not None else download_universe(SIGNAL_UNIVERSE, "1mo")
         if raw.empty:
             return {"day": [], "week": [], "month": []}
 
-        volume = raw["Volume"].dropna(how="all")
-        close = raw["Close"]
+        # Most recent month only, so the "month" window stays ~22 sessions even
+        # when fed the shared 3-month panel.
+        volume = raw["Volume"].tail(22).dropna(how="all")
+        close = raw["Close"].tail(22)
 
         def top_by_volume(vol_series: pd.Series, n: int) -> list:
             ranked = vol_series.sort_values(ascending=False).head(n)
