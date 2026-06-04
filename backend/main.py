@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -18,6 +19,7 @@ from config import (
     ROBINHOOD_MFA_CODE,
 )
 from data.fetcher import (
+    download_universe,
     get_sp500_movers,
     get_batch_history,
     get_options_summary,
@@ -65,48 +67,50 @@ _cache: dict = {
 
 
 def _refresh_all() -> None:
-    """Fetch fresh data and run analysis. Called by scheduler and on-demand."""
+    """Fetch fresh data and run analysis. Called by scheduler and on-demand.
+
+    Strategy: download the whole universe once, derive the price-based panels
+    (movers, history, sparklines, most-traded) locally, and run every
+    independent network fetch concurrently so wall-clock time is bounded by the
+    slowest single call rather than the sum of all of them.
+    """
     logger.info("Refreshing market data...")
     start = time.time()
 
-    # Market movers
-    movers = get_sp500_movers(TOP_MOVERS_COUNT)
-    _cache["movers"] = movers
+    # Single batched download — reused for movers, history, sparklines, volume
+    panel = download_universe(SIGNAL_UNIVERSE, period="3mo")
 
-    # Technical analysis for signal universe
-    history_map = get_batch_history(SIGNAL_UNIVERSE, period="3mo")
-    technical_data = {sym: analyze_ticker(df) for sym, df in history_map.items()}
+    # Kick off the independent network-bound fetches in parallel
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_options = ex.submit(get_options_summary, OPTIONS_WATCHLIST)
+        f_sectors = ex.submit(get_sector_performance)
+        f_fear_greed = ex.submit(get_fear_greed_index)
+        f_earnings = ex.submit(get_earnings_calendar, SIGNAL_UNIVERSE)
+        f_news = ex.submit(get_news, OPTIONS_WATCHLIST)
+        f_reddit = ex.submit(get_reddit_sentiment)
 
-    # AI signals
+        # Meanwhile, derive everything that comes from the shared panel (CPU-only)
+        movers = get_sp500_movers(TOP_MOVERS_COUNT, panel=panel)
+        _cache["movers"] = movers
+        _cache["sparklines"] = get_sparklines(SIGNAL_UNIVERSE, panel=panel)
+        _cache["most_traded"] = get_most_traded(panel=panel)
+
+        history_map = get_batch_history(SIGNAL_UNIVERSE, panel=panel)
+        technical_data = {sym: analyze_ticker(df) for sym, df in history_map.items()}
+
+        # Collect the parallel network results
+        options = f_options.result()
+        _cache["options"] = options
+        _cache["sectors"] = f_sectors.result()
+        _cache["fear_greed"] = f_fear_greed.result()
+        _cache["earnings"] = f_earnings.result()
+        _cache["news"] = f_news.result()
+        _cache["reddit"] = f_reddit.result()
+
+    # AI signals (depends on technical_data) then daily report (depends on signals)
     signals = generate_signals(technical_data)
     _cache["signals"] = signals
 
-    # Options flow
-    options = get_options_summary(OPTIONS_WATCHLIST)
-    _cache["options"] = options
-
-    # Sector performance
-    _cache["sectors"] = get_sector_performance()
-
-    # Fear & Greed Index
-    _cache["fear_greed"] = get_fear_greed_index()
-
-    # Earnings calendar (next 30 days for signal universe)
-    _cache["earnings"] = get_earnings_calendar(SIGNAL_UNIVERSE)
-
-    # Sparklines
-    _cache["sparklines"] = get_sparklines(SIGNAL_UNIVERSE)
-
-    # News
-    _cache["news"] = get_news(OPTIONS_WATCHLIST)
-
-    # Reddit sentiment
-    _cache["reddit"] = get_reddit_sentiment()
-
-    # Most traded by volume
-    _cache["most_traded"] = get_most_traded()
-
-    # AI daily report
     report = generate_daily_report(signals, movers, options)
     _cache["report"] = report
     _cache["last_refresh"] = datetime.utcnow().isoformat() + "Z"
