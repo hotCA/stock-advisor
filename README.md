@@ -1,6 +1,6 @@
 # Stock Advisor AI
 
-An AI-powered stock market dashboard for daily trading, built with Claude Opus, FastAPI, and Next.js.
+An AI-powered stock market dashboard for daily trading, built with Claude Fable 5, FastAPI, and Next.js.
 
 ![status](https://img.shields.io/badge/status-active-brightgreen) ![Python](https://img.shields.io/badge/python-3.9+-blue) ![Next.js](https://img.shields.io/badge/next.js-15-black) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -8,8 +8,9 @@ An AI-powered stock market dashboard for daily trading, built with Claude Opus, 
 
 ## Features
 
-- **AI Trade Signals** — Buy/Sell/Hold/Watch signals with confidence ratings, entry points, targets, and stop losses, powered by Claude Opus
-- **AI Daily Report** — A written market brief (streamed live) covering market pulse, top opportunities, risk radar, options flow, and an action plan
+- **AI Trade Signals** — Buy/Sell/Hold/Watch signals with confidence ratings, entry points, targets, and stop losses, powered by Claude Fable 5 with adaptive thinking
+- **AI Daily Report** — A written market brief (streamed live) covering market pulse, macro backdrop, top opportunities, risk radar, options flow, and an action plan
+- **Macro & Economy Panel** — Claude researches live macro conditions via web search on every full refresh: market trends and themes moving equities, Federal Reserve news and rate expectations, employment data (payrolls, unemployment, jobless claims), economic data (CPI/PCE, GDP, PMI), consumer sentiment, and key macro risks
 - **Support & Resistance Levels** — Auto-computed key price levels for precise entries
 - **Technical Indicators** — RSI, MACD, Bollinger Bands, 50/200 SMA, EMA, volume ratio, and 52-week range per ticker
 - **Sparkline Charts** — ~22-day mini price trend for every ticker
@@ -30,7 +31,7 @@ An AI-powered stock market dashboard for daily trading, built with Claude Opus, 
 
 | Layer | Technology |
 |-------|-----------|
-| AI | Claude Opus (Anthropic) |
+| AI | Claude Fable 5 (Anthropic) with adaptive thinking + web search |
 | Backend | Python 3.9+, FastAPI, yfinance, APScheduler |
 | Frontend | Next.js 15, TypeScript, Tailwind CSS |
 | Data | Yahoo Finance, Reddit public API |
@@ -141,6 +142,7 @@ All endpoints are served from cache and return `{ data, last_refresh, loading }`
 | `GET /api/report/stream` | Daily report streamed via SSE |
 | `GET /api/movers` | Top gainers and losers |
 | `GET /api/most-traded` | Highest-volume tickers (day/week/month) |
+| `GET /api/macro` | Macro brief: market trends, Fed news, employment, economic data, consumer sentiment |
 | `GET /api/sectors` | Sector ETF performance |
 | `GET /api/fear-greed` | Fear & Greed index |
 | `GET /api/earnings` | Upcoming earnings calendar |
@@ -157,11 +159,13 @@ All endpoints are served from cache and return `{ data, last_refresh, loading }`
 
 | Usage | Monthly Cost |
 |-------|-------------|
-| 1 auto-refresh/day | ~$9 |
-| 3 refreshes/day | ~$26 |
+| 1 auto-refresh/day | ~$20 |
+| 3 refreshes/day | ~$55 |
 
-Costs are primarily Claude API usage. System prompts use prompt caching to
-keep token costs down.
+Costs are primarily Claude API usage (Fable 5 at $10/$50 per 1M tokens, plus
+web search at $10 per 1,000 searches — each macro brief runs up to 8 searches).
+System prompts use prompt caching to keep token costs down, and the long-form
+daily report is generated at most once per trading day.
 
 ## Disclaimer
 

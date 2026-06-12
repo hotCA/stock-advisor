@@ -26,3 +26,19 @@ body {
 .badge-watch {
   @apply bg-yellow-900/40 text-yellow-400 border border-yellow-800 px-2 py-0.5 rounded text-xs font-bold;
 }
+
+/* Banner ticker tape — duplicate the content, scroll by -50%, repeat forever
+   so the seam is invisible. Pause on hover so users can read a specific quote. */
+@keyframes ticker-scroll {
+  0%   { transform: translate3d(0, 0, 0); }
+  100% { transform: translate3d(-50%, 0, 0); }
+}
+
+.ticker-scroll {
+  width: max-content;
+  animation: ticker-scroll 80s linear infinite;
+}
+
+.ticker-scroll:hover {
+  animation-play-state: paused;
+}

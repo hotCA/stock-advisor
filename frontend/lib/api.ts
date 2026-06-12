@@ -62,6 +62,7 @@ async function fetchJson<T>(path: string): Promise<T> {
 export async function getMovers(): Promise<{
   data: { gainers: Mover[]; losers: Mover[] } | null;
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/movers");
@@ -70,6 +71,7 @@ export async function getMovers(): Promise<{
 export async function getSignals(): Promise<{
   data: { signals: Signal[]; market_summary: string } | null;
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/signals");
@@ -78,6 +80,7 @@ export async function getSignals(): Promise<{
 export async function getOptions(): Promise<{
   data: OptionsData[] | null;
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/options");
@@ -86,6 +89,7 @@ export async function getOptions(): Promise<{
 export async function getReport(): Promise<{
   data: string | null;
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/report");
@@ -112,11 +116,15 @@ export interface EarningsEvent {
   date: string;
   eps_estimate: number | null;
   revenue_estimate: number | null;
+  eps_actual: number | null;
+  revenue_actual: number | null;
+  reported: boolean;
 }
 
 export async function getSectors(): Promise<{
   data: SectorData[];
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/sectors");
@@ -125,6 +133,7 @@ export async function getSectors(): Promise<{
 export async function getFearGreed(): Promise<{
   data: FearGreedData | null;
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/fear-greed");
@@ -133,6 +142,7 @@ export async function getFearGreed(): Promise<{
 export async function getEarnings(): Promise<{
   data: EarningsEvent[];
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/earnings");
@@ -151,21 +161,6 @@ export interface NewsItem {
   published: number;
 }
 
-export interface PortfolioHolding {
-  symbol: string;
-  quantity: number;
-  avg_price: number;
-  current_price: number;
-  pnl: number;
-  pnl_pct: number;
-}
-
-export interface PortfolioData {
-  equity: number;
-  cash: number;
-  holdings: PortfolioHolding[];
-}
-
 export async function getSparklines(): Promise<{
   data: SparklineData[] | null;
   loading: boolean;
@@ -180,13 +175,6 @@ export async function getNewsData(): Promise<{
   return fetchJson("/news");
 }
 
-export async function getPortfolio(): Promise<{
-  data: PortfolioData | null;
-  message?: string;
-}> {
-  return fetchJson("/portfolio");
-}
-
 export async function getRedditSentiment(): Promise<{
   data: RedditMention[] | null;
   loading: boolean;
@@ -196,21 +184,6 @@ export async function getRedditSentiment(): Promise<{
 
 export async function forceRefresh(): Promise<void> {
   await fetch(`${BASE}/refresh`, { method: "POST" });
-}
-
-export interface PredictionSignal {
-  symbol: string;
-  signal: "BUY" | "SELL";
-  confidence: string;
-  entry: number;
-  target: number;
-  stop_loss: number;
-}
-
-export interface PredictionEntry {
-  timestamp: string;
-  date: string;
-  signals: PredictionSignal[];
 }
 
 export interface MostTradedItem {
@@ -229,14 +202,83 @@ export interface MostTradedData {
 export async function getMostTraded(): Promise<{
   data: MostTradedData | null;
   last_refresh: string;
+  last_full_refresh: string;
   loading: boolean;
 }> {
   return fetchJson("/most-traded");
 }
 
-export async function getPredictionsHistory(): Promise<{
-  data: PredictionEntry[];
-  count: number;
+export interface MarketIndex {
+  symbol: string;
+  name: string;
+  short: string;
+  price: number;
+  change: number;
+  change_pct: number;
+  sparkline: number[];
+}
+
+export async function getIndexes(): Promise<{
+  data: MarketIndex[] | null;
+  last_refresh: string;
+  last_full_refresh: string;
+  loading: boolean;
 }> {
-  return fetchJson("/predictions/history");
+  return fetchJson("/indexes");
+}
+
+export interface MacroIndicator {
+  name: string;
+  value: string;
+  trend: "up" | "down" | "flat";
+  note?: string;
+}
+
+export interface MacroTrend {
+  theme: string;
+  impact: "Positive" | "Negative" | "Mixed";
+  detail: string;
+}
+
+export interface MacroData {
+  outlook: "Bullish" | "Neutral" | "Bearish";
+  outlook_summary: string;
+  market_trends: MacroTrend[];
+  consumer_sentiment: { summary: string; indicators: MacroIndicator[] };
+  fed_watch: {
+    summary: string;
+    next_meeting: string;
+    rate_expectations: string;
+    headlines: string[];
+  };
+  employment: { summary: string; indicators: MacroIndicator[] };
+  economic_data: {
+    summary: string;
+    indicators: MacroIndicator[];
+    upcoming?: string[];
+  };
+  risks: string[];
+  generated_at?: string;
+}
+
+export async function getMacro(): Promise<{
+  data: MacroData | null;
+  last_refresh: string;
+  last_full_refresh: string;
+  loading: boolean;
+}> {
+  return fetchJson("/macro");
+}
+
+export interface Quote {
+  symbol: string;
+  price: number;
+  change_pct: number;
+}
+
+export async function getQuotes(symbols: string[]): Promise<{ data: Quote[] }> {
+  const clean = symbols.map((s) => s.trim().toUpperCase()).filter(Boolean);
+  if (clean.length === 0) return { data: [] };
+  const qs = encodeURIComponent(clean.join(","));
+  return fetchJson(`/quotes?symbols=${qs}`);
 }

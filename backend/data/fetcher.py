@@ -292,7 +292,92 @@ _ETF_TICKERS = {
 }
 
 
-def _earnings_for_symbol(sym: str, now: datetime, cutoff: datetime) -> Optional[dict]:
+def _street_consensus(df) -> Optional[float]:
+    """Extract analyst consensus (avg) from a yfinance estimates DataFrame.
+
+    DataFrame is indexed by horizon (0q current quarter, +1q next quarter,
+    0y current FY, +1y next FY) with columns including `avg`. We want the
+    current-quarter Street average — that's the published consensus for the
+    upcoming earnings event. Falls back to next quarter if the current one
+    is missing or NaN.
+    """
+    if df is None:
+        return None
+    try:
+        if not hasattr(df, "empty") or df.empty or "avg" not in df.columns:
+            return None
+        for period in ("0q", "+1q"):
+            if period not in df.index:
+                continue
+            v = df.at[period, "avg"]
+            if v is None:
+                continue
+            v = float(v)
+            if v != v:  # NaN
+                continue
+            return v
+        return None
+    except Exception:
+        return None
+
+
+def _actuals_for_report(ticker, report_date: datetime) -> tuple:
+    """Look up actuals for the fiscal quarter being reported on `report_date`.
+
+    Returns (eps_actual, revenue_actual) — either may be None if yfinance
+    doesn't expose actuals for that ticker, OR if the upcoming quarter hasn't
+    actually been reported yet. The window is tight on purpose: a typical
+    fiscal quarter ends 30-60 days before the announcement (with a hard floor
+    around 7 days to allow late reporters). Using `<= report_date` instead
+    would silently grab the PREVIOUS quarter's actuals for any upcoming event
+    whose calendar date is in the past (yfinance returns dates at 00:00 UTC,
+    so an after-hours report on `today` looks past from midnight onward).
+    """
+    eps_actual: Optional[float] = None
+    rev_actual: Optional[int] = None
+    rd = pd.Timestamp(report_date.replace(tzinfo=None) if report_date.tzinfo else report_date)
+    earliest = rd - pd.Timedelta(days=100)
+    latest = rd - pd.Timedelta(days=7)
+
+    # EPS actual: earnings_history is keyed by fiscal quarter-end date
+    try:
+        eh = getattr(ticker, "earnings_history", None)
+        if eh is not None and hasattr(eh, "empty") and not eh.empty and "epsActual" in eh.columns:
+            candidates = []
+            for ts in eh.index:
+                ts_p = pd.Timestamp(ts)
+                if earliest <= ts_p <= latest:
+                    v = eh.at[ts, "epsActual"]
+                    if v is not None and v == v:  # not NaN
+                        candidates.append((ts_p, float(v)))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                eps_actual = round(candidates[0][1], 2)
+    except Exception:
+        pass
+
+    # Revenue actual: quarterly_income_stmt's "Total Revenue" row
+    try:
+        qis = getattr(ticker, "quarterly_income_stmt", None)
+        if qis is not None and hasattr(qis, "empty") and not qis.empty and "Total Revenue" in qis.index:
+            tr = qis.loc["Total Revenue"]
+            candidates = []
+            for ts in tr.index:
+                ts_p = pd.Timestamp(ts)
+                if earliest <= ts_p <= latest:
+                    v = tr[ts]
+                    if v is not None and v == v:
+                        candidates.append((ts_p, float(v)))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                rev_actual = int(candidates[0][1])
+    except Exception:
+        pass
+
+    return eps_actual, rev_actual
+
+
+def _earnings_for_symbol(sym: str, start: datetime, cutoff: datetime, now: datetime) -> Optional[dict]:
     """Fetch the next earnings event for a single ticker within the window."""
     try:
         ticker = yf.Ticker(sym)
@@ -303,13 +388,13 @@ def _earnings_for_symbol(sym: str, now: datetime, cutoff: datetime) -> Optional[
         # calendar can be a dict or DataFrame depending on yfinance version
         if isinstance(cal, dict):
             dates = cal.get("Earnings Date", [])
-            eps_est = cal.get("EPS Estimate", None)
-            rev_est = cal.get("Revenue Estimate", None)
+            cal_eps = cal.get("EPS Estimate", None)
+            cal_rev = cal.get("Revenue Estimate", None)
         elif hasattr(cal, "columns"):
             row = cal.iloc[:, 0] if not cal.empty else {}
             dates = row.get("Earnings Date", []) if isinstance(row, dict) else []
-            eps_est = row.get("EPS Estimate", None)
-            rev_est = row.get("Revenue Estimate", None)
+            cal_eps = row.get("EPS Estimate", None)
+            cal_rev = row.get("Revenue Estimate", None)
         else:
             return None
 
@@ -319,6 +404,28 @@ def _earnings_for_symbol(sym: str, now: datetime, cutoff: datetime) -> Optional[
         # dates may be a list of Timestamps or a single Timestamp
         if not isinstance(dates, (list, tuple)):
             dates = [dates]
+
+        # Pull the Street consensus (analyst average) — the calendar field is often
+        # missing for many tickers, but earnings_estimate / revenue_estimate carries
+        # the published consensus for nearly everything covered by analysts.
+        street_eps = None
+        street_rev = None
+        try:
+            street_eps = _street_consensus(getattr(ticker, "earnings_estimate", None))
+        except Exception:
+            pass
+        try:
+            street_rev = _street_consensus(getattr(ticker, "revenue_estimate", None))
+        except Exception:
+            pass
+
+        # Prefer the Street consensus; fall back to whatever the calendar shipped
+        eps_est = street_eps if street_eps is not None else (
+            float(cal_eps) if cal_eps is not None else None
+        )
+        rev_est = street_rev if street_rev is not None else (
+            float(cal_rev) if cal_rev is not None else None
+        )
 
         for dt in dates:
             try:
@@ -332,12 +439,23 @@ def _earnings_for_symbol(sym: str, now: datetime, cutoff: datetime) -> Optional[
                     dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
                 else:
                     continue
-                if now <= dt <= cutoff:
+                if start <= dt <= cutoff:
+                    # Always attempt the actuals lookup — the window inside
+                    # `_actuals_for_report` excludes the previous quarter, so a
+                    # future event harmlessly returns (None, None) until the
+                    # company actually files. `reported` is then driven by the
+                    # PRESENCE of actuals rather than the calendar clock,
+                    # avoiding the 00:00-UTC false-positive on report day.
+                    eps_actual, rev_actual = _actuals_for_report(ticker, dt)
+                    has_actual = eps_actual is not None or rev_actual is not None
                     return {
                         "symbol": sym,
                         "date": dt.strftime("%Y-%m-%d"),
-                        "eps_estimate": round(float(eps_est), 2) if eps_est is not None else None,
+                        "eps_estimate": round(eps_est, 2) if eps_est is not None else None,
                         "revenue_estimate": int(rev_est) if rev_est is not None else None,
+                        "eps_actual": eps_actual,
+                        "revenue_actual": rev_actual,
+                        "reported": has_actual,
                     }
             except Exception:
                 continue
@@ -348,8 +466,14 @@ def _earnings_for_symbol(sym: str, now: datetime, cutoff: datetime) -> Optional[
 
 
 def get_earnings_calendar(symbols: List[str]) -> List[dict]:
-    """Get upcoming earnings dates for watchlist tickers (next 30 days, in parallel)."""
+    """Return earnings events from the past 7 days through the next 30.
+
+    Keeping just-reported events in the calendar for a week lets the dashboard
+    show actuals + beat/miss alongside the original estimates, instead of having
+    the row disappear the moment the report date passes.
+    """
     now = datetime.now(timezone.utc)
+    start = now - timedelta(days=7)
     cutoff = now + timedelta(days=30)
 
     # ETFs don't have earnings — skip them to avoid 404 noise
@@ -357,7 +481,7 @@ def get_earnings_calendar(symbols: List[str]) -> List[dict]:
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = [
-            r for r in ex.map(lambda s: _earnings_for_symbol(s, now, cutoff), symbols)
+            r for r in ex.map(lambda s: _earnings_for_symbol(s, start, cutoff, now), symbols)
             if r
         ]
 
@@ -507,15 +631,28 @@ def get_most_traded(top_n: int = 20, panel: Optional[pd.DataFrame] = None) -> di
             ranked = vol_series.sort_values(ascending=False).head(n)
             result = []
             for sym in ranked.index:
-                price = float(close.iloc[-1][sym]) if sym in close.columns else 0
-                if len(close) >= 2 and sym in close.columns:
+                # Skip rows where yfinance returned NaN for the latest close —
+                # otherwise the response carries a NaN float and FastAPI's JSON
+                # encoder raises "Out of range float values are not JSON compliant".
+                if sym not in close.columns:
+                    continue
+                price = float(close.iloc[-1][sym])
+                if price != price:  # NaN
+                    continue
+                if len(close) >= 2:
                     prev = float(close.iloc[-2][sym])
-                    change_pct = round((price - prev) / prev * 100, 2) if prev else 0
+                    if prev != prev or not prev:
+                        change_pct = 0.0
+                    else:
+                        change_pct = round((price - prev) / prev * 100, 2)
                 else:
-                    change_pct = 0
+                    change_pct = 0.0
+                vol = ranked[sym]
+                if vol != vol:  # NaN
+                    continue
                 result.append({
                     "symbol": sym,
-                    "volume": int(ranked[sym]),
+                    "volume": int(vol),
                     "price": round(price, 2),
                     "change_pct": change_pct,
                 })
@@ -583,3 +720,94 @@ def get_robinhood_portfolio() -> Optional[dict]:
     except Exception as e:
         logger.warning(f"Portfolio fetch failed: {e}")
         return None
+
+
+MARKET_INDEXES = [
+    {"symbol": "^GSPC", "name": "S&P 500", "short": "SPX"},
+    {"symbol": "^IXIC", "name": "NASDAQ Composite", "short": "IXIC"},
+    {"symbol": "^DJI", "name": "Dow Jones", "short": "DJI"},
+]
+
+
+def get_market_indexes() -> List[dict]:
+    """Fetch current value + 30-day sparkline for the three major US indexes.
+
+    Returns one row per index with: name, short label, price, day change, day %,
+    and a small sparkline of recent closes. Falls back to an empty list on error.
+    """
+    out: List[dict] = []
+    for meta in MARKET_INDEXES:
+        try:
+            t = yf.Ticker(meta["symbol"])
+            hist = t.history(period="1mo", auto_adjust=True)["Close"].dropna()
+            if len(hist) < 2:
+                continue
+            last = float(hist.iloc[-1])
+            prev = float(hist.iloc[-2])
+            change = last - prev
+            change_pct = (change / prev * 100) if prev else 0
+            prices = [round(float(p), 2) for p in hist.tail(30).tolist()]
+            out.append({
+                "symbol": meta["symbol"],
+                "name": meta["name"],
+                "short": meta["short"],
+                "price": round(last, 2),
+                "change": round(change, 2),
+                "change_pct": round(change_pct, 2),
+                "sparkline": prices,
+            })
+        except Exception as e:
+            logger.warning(f"Index fetch failed for {meta['symbol']}: {e}")
+            continue
+    return out
+
+
+def get_quotes(symbols: List[str]) -> List[dict]:
+    """Batch-fetch last price + day % change for arbitrary tickers.
+
+    Used by the personal portfolio so users can hold any ticker, not just
+    those already in our cached universe. Returns one row per resolvable symbol.
+    """
+    symbols = [s.strip().upper() for s in symbols if s and s.strip()]
+    if not symbols:
+        return []
+    try:
+        raw = yf.download(
+            symbols, period="2d", interval="1d",
+            progress=False, auto_adjust=True, threads=True, group_by="column",
+        )
+        if raw.empty:
+            return []
+        # Single-symbol downloads come back without a MultiIndex on columns.
+        if not isinstance(raw.columns, pd.MultiIndex):
+            close = raw["Close"].dropna()
+            if len(close) < 1:
+                return []
+            last = float(close.iloc[-1])
+            prev = float(close.iloc[-2]) if len(close) >= 2 else last
+            change_pct = ((last - prev) / prev * 100) if prev else 0
+            return [{
+                "symbol": symbols[0],
+                "price": round(last, 2),
+                "change_pct": round(change_pct, 2),
+            }]
+        close = raw["Close"]
+        results = []
+        for sym in symbols:
+            if sym not in close.columns:
+                continue
+            series = close[sym].dropna()
+            if len(series) < 1:
+                continue
+            last = float(series.iloc[-1])
+            prev = float(series.iloc[-2]) if len(series) >= 2 else last
+            change_pct = ((last - prev) / prev * 100) if prev else 0
+            results.append({
+                "symbol": sym,
+                "price": round(last, 2),
+                "change_pct": round(change_pct, 2),
+            })
+        return results
+    except Exception as e:
+        logger.warning(f"Quote fetch failed for {symbols}: {e}")
+        return []
