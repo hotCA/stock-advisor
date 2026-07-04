@@ -28,4 +28,6 @@ Thumbs.db
 
 # Generated / local data
 backend/data/predictions_log.json
+backend/data/report_cache.json
+backend/data/macro_cache.json
 frontend/tsconfig.tsbuildinfo

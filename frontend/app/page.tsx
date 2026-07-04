@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import MarketMovers from "@/components/MarketMovers";
 import SignalsTable from "@/components/SignalsTable";
 import AIReport from "@/components/AIReport";
@@ -10,8 +10,12 @@ import EarningsCalendar from "@/components/EarningsCalendar";
 import SectorHeatmap from "@/components/SectorHeatmap";
 import NewsFeed from "@/components/NewsFeed";
 import RedditSentiment from "@/components/RedditSentiment";
-import PaperTrading from "@/components/PaperTrading";
 import MostTraded from "@/components/MostTraded";
+import SignalBreakdown from "@/components/SignalBreakdown";
+import MarketBreadth from "@/components/MarketBreadth";
+import PersonalPortfolio from "@/components/PersonalPortfolio";
+import MarketIndexes from "@/components/MarketIndexes";
+import MacroPulse from "@/components/MacroPulse";
 import {
   getMovers,
   getSignals,
@@ -24,6 +28,8 @@ import {
   getNewsData,
   getRedditSentiment,
   getMostTraded,
+  getIndexes,
+  getMacro,
   forceRefresh,
   type Mover,
   type Signal,
@@ -35,12 +41,11 @@ import {
   type NewsItem,
   type RedditMention,
   type MostTradedData,
+  type MarketIndex,
+  type MacroData,
 } from "@/lib/api";
 
-type Tab = "dashboard" | "paper";
-
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const [gainers, setGainers] = useState<Mover[]>([]);
   const [losers, setLosers] = useState<Mover[]>([]);
   const [signals, setSignals] = useState<Signal[]>([]);
@@ -54,15 +59,22 @@ export default function Dashboard() {
   const [news, setNews] = useState<NewsItem[]>([]);
   const [reddit, setReddit] = useState<RedditMention[]>([]);
   const [mostTraded, setMostTraded] = useState<MostTradedData | null>(null);
+  const [indexes, setIndexes] = useState<MarketIndex[]>([]);
+  const [macro, setMacro] = useState<MacroData | null>(null);
   const [lastRefresh, setLastRefresh] = useState("");
+  const [lastFullRefresh, setLastFullRefresh] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+  const inFlightRef = useRef(false);
 
   const fetchAll = useCallback(async () => {
+    // Skip overlapping fetches — at 5s cadence the previous one may not be done yet.
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
       setError("");
-      const [moversRes, signalsRes, optionsRes, reportRes, fgRes, earningsRes, sectorsRes, sparklinesRes, newsRes, redditRes, mostTradedRes] =
+      const [moversRes, signalsRes, optionsRes, reportRes, fgRes, earningsRes, sectorsRes, sparklinesRes, newsRes, redditRes, mostTradedRes, indexesRes, macroRes] =
         await Promise.all([
           getMovers(),
           getSignals(),
@@ -75,6 +87,8 @@ export default function Dashboard() {
           getNewsData(),
           getRedditSentiment(),
           getMostTraded(),
+          getIndexes(),
+          getMacro(),
         ]);
 
       const stillLoading = moversRes.loading || signalsRes.loading;
@@ -92,17 +106,23 @@ export default function Dashboard() {
       setNews(newsRes.data ?? []);
       setReddit(redditRes.data ?? []);
       setMostTraded(mostTradedRes.data ?? null);
+      setIndexes(indexesRes.data ?? []);
+      setMacro(macroRes.data ?? null);
       setLastRefresh(moversRes.last_refresh ?? "");
+      setLastFullRefresh(moversRes.last_full_refresh ?? "");
       setLoading(stillLoading);
     } catch (e) {
       setError("Failed to load market data. Is the backend running on port 8000?");
       setLoading(false);
+    } finally {
+      inFlightRef.current = false;
     }
   }, []);
 
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, loading ? 10_000 : 5 * 60 * 1000);
+    // 10s during initial load (waiting for first data), then 5s for live polling
+    const interval = setInterval(fetchAll, loading ? 10_000 : 5_000);
     return () => clearInterval(interval);
   }, [fetchAll, loading]);
 
@@ -110,13 +130,15 @@ export default function Dashboard() {
     setRefreshing(true);
     try {
       await forceRefresh();
-      const prevRefresh = lastRefresh;
+      // Watch last_full_refresh, not last_refresh — the 60s light-refresh job
+      // also bumps last_refresh during market hours and would otherwise trip
+      // the completion check before signals/report are actually regenerated.
+      const prevFull = lastFullRefresh;
       let attempts = 0;
       const poll = setInterval(async () => {
         attempts++;
-        // Check the API directly — avoids stale closure on lastRefresh state
         const check = await getMovers();
-        if (check.last_refresh !== prevRefresh || attempts >= 18) {
+        if (check.last_full_refresh !== prevFull || attempts >= 18) {
           clearInterval(poll);
           await fetchAll();
           setRefreshing(false);
@@ -151,64 +173,34 @@ export default function Dashboard() {
     );
   }
 
-  const buyCount = signals.filter((s) => s.signal === "BUY").length;
-  const sellCount = signals.filter((s) => s.signal === "SELL").length;
-  const highConfCount = signals.filter((s) => s.confidence === "High").length;
-
   return (
     <div className="space-y-6">
-      {/* Tab navigation */}
-      <div className="flex gap-1 border-b border-[#21262d] pb-0">
-        <button
-          onClick={() => setActiveTab("dashboard")}
-          className={`px-4 py-2 text-sm font-medium rounded-t transition-colors -mb-px ${
-            activeTab === "dashboard"
-              ? "bg-[#161b22] border border-b-[#161b22] border-[#21262d] text-zinc-100"
-              : "text-zinc-500 hover:text-zinc-300"
-          }`}
-        >
-          Dashboard
-        </button>
-        <button
-          onClick={() => setActiveTab("paper")}
-          className={`px-4 py-2 text-sm font-medium rounded-t transition-colors -mb-px flex items-center gap-1.5 ${
-            activeTab === "paper"
-              ? "bg-[#161b22] border border-b-[#161b22] border-[#21262d] text-zinc-100"
-              : "text-zinc-500 hover:text-zinc-300"
-          }`}
-        >
-          <span className="w-2 h-2 rounded-full bg-yellow-500 inline-block" />
-          Paper Trading
-        </button>
-      </div>
-
-      {activeTab === "paper" && (
-        <PaperTrading signals={signals} movers={[...gainers, ...losers]} />
-      )}
-
-      {activeTab === "dashboard" && <>
       {/* Earnings Calendar */}
       {earnings.length > 0 && <EarningsCalendar events={earnings} />}
 
-      {/* Header stats */}
-      <div className="flex items-center justify-between">
-        <div className="flex gap-4">
-          <div className="card py-3 px-5 flex flex-col items-center min-w-[80px]">
-            <span className="text-2xl font-bold text-green-400">{buyCount}</span>
-            <span className="text-xs text-zinc-500 mt-0.5">BUY</span>
+      {/* Hero header: title + live indicator + refresh */}
+      <div className="flex items-end justify-between">
+        <div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-semibold text-zinc-100 tracking-tight">Market Snapshot</h1>
+            <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-widest text-green-400 bg-green-500/10 border border-green-500/30 rounded-full px-2 py-0.5">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75 animate-ping" />
+                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+              </span>
+              Live
+            </span>
           </div>
-          <div className="card py-3 px-5 flex flex-col items-center min-w-[80px]">
-            <span className="text-2xl font-bold text-red-400">{sellCount}</span>
-            <span className="text-xs text-zinc-500 mt-0.5">SELL</span>
-          </div>
-          <div className="card py-3 px-5 flex flex-col items-center min-w-[80px]">
-            <span className="text-2xl font-bold text-blue-400">{highConfCount}</span>
-            <span className="text-xs text-zinc-500 mt-0.5">HIGH CONF</span>
-          </div>
-          <div className="card py-3 px-5 flex flex-col items-center min-w-[80px]">
-            <span className="text-2xl font-bold text-zinc-200">{signals.length}</span>
-            <span className="text-xs text-zinc-500 mt-0.5">SIGNALS</span>
-          </div>
+          {(lastFullRefresh || lastRefresh) && (
+            <p className="text-xs text-zinc-500 mt-1">
+              AI report · {new Date(lastFullRefresh || lastRefresh).toLocaleString()}
+              {lastRefresh && lastFullRefresh && lastRefresh !== lastFullRefresh && (
+                <span className="text-zinc-600">
+                  {" "}· prices {new Date(lastRefresh).toLocaleTimeString()}
+                </span>
+              )}
+            </p>
+          )}
         </div>
         <button
           onClick={handleRefresh}
@@ -216,18 +208,35 @@ export default function Dashboard() {
           className="flex items-center gap-2 text-sm bg-[#161b22] hover:bg-[#1c2333] border border-[#21262d] px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
         >
           <span className={refreshing ? "animate-spin" : ""}>⟳</span>
-          {refreshing ? "Refreshing..." : "Refresh Now"}
+          {refreshing ? "Refreshing..." : "Full Refresh"}
         </button>
       </div>
 
-      {/* Fear & Greed + Sector Heatmap | AI Report */}
-      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-6">
-        <div className="flex flex-col gap-6">
-          <FearGreedIndex data={fearGreed} />
-          <SectorHeatmap sectors={sectors} />
-        </div>
+      {/* Major Indexes hero — S&P 500, NASDAQ, Dow Jones */}
+      <MarketIndexes indexes={indexes} />
+
+      {/* Mood row: Signal Mix | Market Breadth | Fear & Greed */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <SignalBreakdown signals={signals} />
+        <MarketBreadth gainers={gainers} losers={losers} />
+        <FearGreedIndex data={fearGreed} />
+      </div>
+
+      {/* Sector Heatmap | AI Report */}
+      <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
+        <SectorHeatmap sectors={sectors} />
         <AIReport report={report} lastRefresh={lastRefresh} />
       </div>
+
+      {/* Macro & Economy — Fed, employment, economic data, consumer sentiment */}
+      <MacroPulse macro={macro} />
+
+      {/* Personal Portfolio */}
+      <PersonalPortfolio
+        signals={signals}
+        movers={[...gainers, ...losers]}
+        sectors={sectors}
+      />
 
       {/* Market Movers */}
       <MarketMovers gainers={gainers} losers={losers} />
@@ -246,7 +255,6 @@ export default function Dashboard() {
 
       {/* Options Flow */}
       {options.length > 0 && <OptionsFlow options={options} />}
-      </>}
     </div>
   );
 }
