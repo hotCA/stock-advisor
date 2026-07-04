@@ -377,6 +377,22 @@ def _actuals_for_report(ticker, report_date: datetime) -> tuple:
     return eps_actual, rev_actual
 
 
+def _calendar_est(v) -> Optional[float]:
+    """Coerce a calendar estimate to float, treating NaN/unparseable as missing.
+
+    yfinance calendars ship NaN for tickers without analyst coverage; passing
+    that through would put NaN in the JSON response and trip FastAPI's encoder
+    ("Out of range float values are not JSON compliant").
+    """
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if v != v else v
+
+
 def _earnings_for_symbol(sym: str, start: datetime, cutoff: datetime, now: datetime) -> Optional[dict]:
     """Fetch the next earnings event for a single ticker within the window."""
     try:
@@ -420,12 +436,8 @@ def _earnings_for_symbol(sym: str, start: datetime, cutoff: datetime, now: datet
             pass
 
         # Prefer the Street consensus; fall back to whatever the calendar shipped
-        eps_est = street_eps if street_eps is not None else (
-            float(cal_eps) if cal_eps is not None else None
-        )
-        rev_est = street_rev if street_rev is not None else (
-            float(cal_rev) if cal_rev is not None else None
-        )
+        eps_est = street_eps if street_eps is not None else _calendar_est(cal_eps)
+        rev_est = street_rev if street_rev is not None else _calendar_est(cal_rev)
 
         for dt in dates:
             try:
